@@ -22,6 +22,10 @@
 #include "SIM_Motor.h"
 #include "SIM_Frame.h"
 
+/* ADDED */
+#include <AP_HAL/utility/Socket.h>
+
+
 namespace SITL {
 
 /*
