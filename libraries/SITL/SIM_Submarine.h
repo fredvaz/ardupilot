@@ -41,8 +41,45 @@ public:
         return new Submarine(home_str, frame_str);
     }
 
+    /*  ADDED: Create and set in/out socket for Gazebo simulator */
+    void set_interface_ports(const char* address, const int port_in, const int port_out);
+
+
+private:
+    /*
+      packet sent to Gazebo
+    */
+    struct servo_packet {
+      // size matches sitl_input upstream
+        float motor_speed[16];
+    };
+
+    /*
+      reply packet sent from Gazebo to ArduPilot
+    */
+    struct fdm_packet {
+      double timestamp;  // in seconds
+      double imu_angular_velocity_rpy[3];
+      double imu_linear_acceleration_xyz[3];
+      double imu_orientation_quat[4];
+      double velocity_xyz[3];
+      double position_xyz[3];
+    };
+
+    void recv_fdm(const struct sitl_input &input);
+    void send_servos(const struct sitl_input &input);
+    void drain_sockets();
+
+    double last_timestamp;
+
+    SocketAPM socket_sitl;
+    const char *_gazebo_address = "127.0.0.1";
+    int _gazebo_port = 9002;
+    static const uint64_t GAZEBO_TIMEOUT_US = 5000000;
 
 protected:
+
+    // This is in Gazebo? not need?
     const float water_density = 1023.6; // (kg/m^3) At a temperature of 25 °C, salinity of 35 g/kg and 1 atm pressure
 
     const class FrameConfig {
@@ -57,16 +94,19 @@ protected:
         float bouyancy_acceleration = GRAVITY_MSS + net_bouyancy/weight;
     } frame_proprietary;
 
+    // ??
     bool on_ground() const override;
 
     // calculate rotational and linear accelerations
-    void calculate_forces(const struct sitl_input &input, Vector3f &rot_accel, Vector3f &body_accel);
+    //void calculate_forces(const struct sitl_input &input, Vector3f &rot_accel, Vector3f &body_accel);
     // calculate buoyancy
-    float calculate_buoyancy_acceleration();
+    //float calculate_buoyancy_acceleration();
 
     Frame *frame;
 };
 
+
+// ??
 class Thruster {
 public:
     Thruster(int8_t _servo, float roll_fac, float pitch_fac, float yaw_fac, float throttle_fac, float forward_fac, float lat_fac) :

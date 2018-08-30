@@ -16,6 +16,11 @@
   Submarine simulator class
 */
 
+/* Gazebo SITL */
+//#include "SIM_Gazebo.h"
+#include <AP_HAL/AP_HAL.h>
+#include <errno.h>
+
 #include "SIM_Submarine.h"
 #include <AP_Motors/AP_Motors.h>
 #include "Frame_Vectored.h"
@@ -24,111 +29,168 @@
 
 using namespace SITL;
 
-static Thruster vectored_thrusters[] =
-{
-       Thruster(0, MOT_1_ROLL_FACTOR, MOT_1_PITCH_FACTOR, MOT_1_YAW_FACTOR, MOT_1_THROTTLE_FACTOR, MOT_1_FORWARD_FACTOR, MOT_1_STRAFE_FACTOR),
-       Thruster(1, MOT_2_ROLL_FACTOR, MOT_2_PITCH_FACTOR, MOT_2_YAW_FACTOR, MOT_2_THROTTLE_FACTOR, MOT_2_FORWARD_FACTOR, MOT_2_STRAFE_FACTOR),
-       Thruster(2, MOT_3_ROLL_FACTOR, MOT_3_PITCH_FACTOR, MOT_3_YAW_FACTOR, MOT_3_THROTTLE_FACTOR, MOT_3_FORWARD_FACTOR, MOT_3_STRAFE_FACTOR),
-       Thruster(3, MOT_4_ROLL_FACTOR, MOT_4_PITCH_FACTOR, MOT_4_YAW_FACTOR, MOT_4_THROTTLE_FACTOR, MOT_4_FORWARD_FACTOR, MOT_4_STRAFE_FACTOR),
-       Thruster(4, MOT_5_ROLL_FACTOR, MOT_5_PITCH_FACTOR, MOT_5_YAW_FACTOR, MOT_5_THROTTLE_FACTOR, MOT_5_FORWARD_FACTOR, MOT_5_STRAFE_FACTOR),
-       Thruster(5, MOT_6_ROLL_FACTOR, MOT_6_PITCH_FACTOR, MOT_6_YAW_FACTOR, MOT_6_THROTTLE_FACTOR, MOT_6_FORWARD_FACTOR, MOT_6_STRAFE_FACTOR)
 
-};
-
+/*
+  Class constructor
+ */
 Submarine::Submarine(const char *home_str, const char *frame_str) :
     Aircraft(home_str, frame_str),
-    frame(NULL)
+    last_timestamp(0),
+    socket_sitl{true}
+    //frame(NULL)
 {
     frame_height = 0.0;
     ground_behavior = GROUND_BEHAVIOR_NONE;
+
+    // try to bind to a specific port so that if we restart ArduPilot
+    // Gazebo keeps sending us packets. Not strictly necessary but
+    // useful for debugging
+    fprintf(stdout, "Starting SITL Gazebo\n");
 }
 
-// calculate rotational and linear accelerations
-void Submarine::calculate_forces(const struct sitl_input &input, Vector3f &rot_accel, Vector3f &body_accel)
-{
-    rot_accel = Vector3f(0,0,0);
-
-    // slight positive buoyancy
-    body_accel = Vector3f(0, 0, -calculate_buoyancy_acceleration());
-
-    for (int i = 0; i < 6; i++) {
-        Thruster t = vectored_thrusters[i];
-        int16_t pwm = input.servos[t.servo];
-        float output = 0;
-        if (pwm < 2000 && pwm > 1000) {
-         output = (pwm - 1500) / 400.0; // range -1~1
-        }
-
-        // 2.5 scalar for approximate real-life performance of T200 thruster
-        body_accel += t.linear * output * 2.5;
-
-        rot_accel += t.rotational * output;
-    }
-
-    // Limit movement at the sea floor
-    if (position.z > 100 && body_accel.z > -GRAVITY_MSS) {
-    	body_accel.z = -GRAVITY_MSS;
-    }
-
-    float terminal_rotation_rate = 10.0;
-    if (terminal_rotation_rate > 0) {
-        // rotational air resistance
-        rot_accel.x -= gyro.x * radians(400.0) / terminal_rotation_rate;
-        rot_accel.y -= gyro.y * radians(400.0) / terminal_rotation_rate;
-        rot_accel.z -= gyro.z * radians(400.0) / terminal_rotation_rate;
-    }
-
-    float terminal_velocity = 3.0;
-    if (terminal_velocity > 0) {
-        // air resistance
-        Vector3f air_resistance = -velocity_air_ef * (GRAVITY_MSS/terminal_velocity);
-        body_accel += dcm.transposed() * air_resistance;
-    }
-}
-
-/**
-* @brief Calculate buoyancy force of the frame
-*
-* @return float
+/*
+  Create and set in/out socket
 */
-float Submarine::calculate_buoyancy_acceleration()
+void Submarine::set_interface_ports(const char* address, const int port_in, const int port_out)
 {
-    float below_water_level = position.z - frame_proprietary.height/2;
+    if (!socket_sitl.bind("0.0.0.0", port_in)) {
+        fprintf(stderr, "SITL: socket in bind failed on sim in : %d  - %s\n", port_in, strerror(errno));
+        fprintf(stderr, "Abording launch...\n");
+        exit(1);
+    }
+    printf("Bind %s:%d for SITL in\n", "127.0.0.1", port_in);
+    socket_sitl.reuseaddress();
+    socket_sitl.set_blocking(false);
 
-    // Completely above water level
-    if (below_water_level < 0) {
-        return 0.0f;
+    _gazebo_address = address;
+    _gazebo_port = port_out;
+    printf("Setting Gazebo interface to %s:%d \n", _gazebo_address, _gazebo_port);
+}
+
+/*
+  decode and send servos
+*/
+void Submarine::send_servos(const struct sitl_input &input)
+{
+    servo_packet pkt;
+    // should rename servo_command
+    // 16 because struct sitl_input.servos is 16 large in SIM_Aircraft.h
+    for (unsigned i = 0; i < 16; ++i)
+    {
+      pkt.motor_speed[i] = (input.servos[i]-1000) / 1000.0f;
+    }
+    socket_sitl.sendto(&pkt, sizeof(pkt), _gazebo_address, _gazebo_port);
+}
+
+/*
+  receive an update from the FDM
+  This is a blocking function
+ */
+void Submarine::recv_fdm(const struct sitl_input &input) //Gazebo::
+{
+    fdm_packet pkt;
+
+    /*
+      we re-send the servo packet every 0.1 seconds until we get a
+      reply. This allows us to cope with some packet loss to the FDM
+     */
+    while (socket_sitl.recv(&pkt, sizeof(pkt), 100) != sizeof(pkt)) {
+        send_servos(input);
+        // Reset the timestamp after a long disconnection, also catch gazebo reset
+        if (get_wall_time_us() > last_wall_time_us + GAZEBO_TIMEOUT_US) {
+            last_timestamp = 0;
+        }
     }
 
-    // Completely below water level
-    if (below_water_level > frame_proprietary.height/2) {
-        return frame_proprietary.bouyancy_acceleration;
+    const double deltat = pkt.timestamp - last_timestamp;  // in seconds
+    if (deltat < 0) {  // don't use old paquet
+        time_now_us += 1;
+        return;
     }
+    // get imu stuff
+    accel_body = Vector3f(static_cast<float>(pkt.imu_linear_acceleration_xyz[0]),
+                          static_cast<float>(pkt.imu_linear_acceleration_xyz[1]),
+                          static_cast<float>(pkt.imu_linear_acceleration_xyz[2]));
 
-    // bouyant force is proportional to fraction of height in water
-    return frame_proprietary.bouyancy_acceleration * below_water_level/frame_proprietary.height;
-};
+    gyro = Vector3f(static_cast<float>(pkt.imu_angular_velocity_rpy[0]),
+                    static_cast<float>(pkt.imu_angular_velocity_rpy[1]),
+                    static_cast<float>(pkt.imu_angular_velocity_rpy[2]));
+
+    // compute dcm from imu orientation
+    Quaternion quat(static_cast<float>(pkt.imu_orientation_quat[0]),
+                    static_cast<float>(pkt.imu_orientation_quat[1]),
+                    static_cast<float>(pkt.imu_orientation_quat[2]),
+                    static_cast<float>(pkt.imu_orientation_quat[3]));
+    quat.rotation_matrix(dcm);
+
+    velocity_ef = Vector3f(static_cast<float>(pkt.velocity_xyz[0]),
+                           static_cast<float>(pkt.velocity_xyz[1]),
+                           static_cast<float>(pkt.velocity_xyz[2]));
+
+    position = Vector3f(static_cast<float>(pkt.position_xyz[0]),
+                        static_cast<float>(pkt.position_xyz[1]),
+                        static_cast<float>(pkt.position_xyz[2]));
+
+
+    // auto-adjust to simulation frame rate
+    time_now_us += static_cast<uint64_t>(deltat * 1.0e6);
+
+    if (deltat < 0.01 && deltat > 0) {
+        adjust_frame_time(static_cast<float>(1.0/deltat));
+    }
+    last_timestamp = pkt.timestamp;
+
+}
+
+/*
+  Drain remaining data on the socket to prevent phase lag.
+ */
+void Submarine::drain_sockets()
+{
+    const uint16_t buflen = 1024;
+    char buf[buflen];
+    ssize_t received;
+    errno = 0;
+    do {
+        received = socket_sitl.recv(buf, buflen, 0);
+        if (received < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != 0) {
+                fprintf(stderr, "error recv on socket in: %s \n",
+                        strerror(errno));
+            }
+        } else {
+            // fprintf(stderr, "received from control socket: %s\n", buf);
+        }
+    } while (received > 0);
+
+}
 
 /*
   update the Submarine simulation by one time step
  */
 void Submarine::update(const struct sitl_input &input)
 {
-    // get wind vector setup
-    update_wind(input);
+    // get wind vector setup - I think we not need, we Gazebo hydrodynamics parameters
+    //update_wind(input);                                       // From Aircraft Class
 
-    Vector3f rot_accel;
+    //Vector3f rot_accel;
 
-    calculate_forces(input, rot_accel, accel_body);
+    //calculate_forces(input, rot_accel, accel_body);
+                                                    // From SITL Submarine Class
 
-    update_dynamics(rot_accel);
+    send_servos(input);                           // From Gazebo Submarine Class
+    recv_fdm(input);                              // From Gazebo Submarine Class
+
+    //update_dynamics(rot_accel);                         // From Aircraft Class
 
     // update lat/lon/altitude
-    update_position();
-    time_advance();
+    update_position();                                    // From Aircraft Class
+    time_advance();                                       // From Aircraft Class
 
     // update magnetic field
-    update_mag_field_bf();
+    update_mag_field_bf();                                // From Aircraft Class
+
+    drain_sockets();                              // From Gazebo Submarine Class
 }
 
 /*
